@@ -1,0 +1,240 @@
+// 企业多维数据管理系统 - Prisma Schema (MySQL 8.x)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== 用户与角色 ====================
+
+model User {
+  id           String         @id @default(cuid())
+  username     String         @unique @db.VarChar(64)
+  email        String         @unique @db.VarChar(255)
+  displayName  String         @map("display_name") @db.VarChar(128)
+  passwordHash String         @map("password_hash") @db.VarChar(255)
+  isActive     Boolean        @map("is_active") @default(true)
+  lastLoginAt  DateTime?      @map("last_login_at") @db.Timestamp(0)
+  createdAt    DateTime       @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt    DateTime       @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  roles          UserRole[]
+  refreshTokens  RefreshToken[]
+  apiKeys        ApiKey[]
+  auditLogs      AuditLog[]
+
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  code        String   @unique @db.VarChar(64)
+  name        String   @db.VarChar(128)
+  description String?  @db.VarChar(512)
+  // 权限编码数组，如 ["project:read","record:write"]，ADMIN 角色为 ["*"]
+  permissions Json?
+  isSystem    Boolean  @map("is_system") @default(false)
+  createdAt   DateTime @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt   DateTime @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  users UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  userId String @map("user_id")
+  roleId String @map("role_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+// ==================== 项目 / 表 / 字段 / 记录 ====================
+
+model Project {
+  id          String      @id @default(cuid())
+  name        String      @db.VarChar(128)
+  description String?     @db.Text
+  createdBy   String      @map("created_by") @db.VarChar(64)
+  createdAt   DateTime    @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt   DateTime    @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  tables DataTable[]
+
+  @@map("projects")
+}
+
+model DataTable {
+  id                String      @id @default(cuid())
+  projectId         String      @map("project_id")
+  name              String      @db.VarChar(128)
+  description       String?     @db.Text
+  // SYSTEM | EXTERNAL
+  tableType         String      @map("table_type") @db.VarChar(32)
+  // EXTERNAL 表注册的物理表名（来自 information_schema 白名单）
+  externalTableName String?     @map("external_table_name") @db.VarChar(128)
+  createdBy         String      @map("created_by") @db.VarChar(64)
+  createdAt         DateTime    @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt         DateTime    @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  project           Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fields            DataField[]
+  records           TableRecord[]
+  uniqueConstraints UniqueConstraint[]
+
+  @@index([projectId])
+  @@map("data_tables")
+}
+
+model DataField {
+  id                String   @id @default(cuid())
+  tableId           String   @map("table_id")
+  name              String   @db.VarChar(128)
+  // 稳定引用标识（不可修改），公式/查询/唯一约束全部依赖它
+  fieldKey          String   @map("field_key") @db.VarChar(128)
+  // STRING | SINGLE_LINE_TEXT | MULTI_LINE_TEXT | NUMBER | SINGLE_SELECT | MULTI_SELECT | DATE | FORMULA
+  fieldType         String   @map("field_type") @db.VarChar(32)
+  // 类型相关配置：options / showTime / maxLength ...
+  config            Json?
+  sortOrder         Int      @map("sort_order") @default(0)
+  isUnique          Boolean  @map("is_unique") @default(false)
+  isIndexed         Boolean  @map("is_indexed") @default(false)
+
+  // ===== FORMULA =====
+  formulaExpression String?  @map("formula_expression") @db.Text
+  formulaAst        Json?    @map("formula_ast")
+  formulaResultType String?  @map("formula_result_type") @db.VarChar(16)
+  formulaVersion    Int      @map("formula_version") @default(0)
+
+  createdAt         DateTime @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt         DateTime @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  table DataTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@unique([tableId, fieldKey])
+  @@unique([tableId, name])
+  @@index([tableId, sortOrder])
+  @@map("data_fields")
+}
+
+model TableRecord {
+  id            String    @id @default(cuid())
+  tableId       String    @map("table_id")
+  // 动态数据：{ field_key: value }，FORMULA 结果物化保存在这里
+  data          Json
+  // 公式计算错误：{ field_key: "FORMULA_DIVIDE_BY_ZERO" }
+  formulaErrors Json?     @map("formula_errors")
+  createdBy     String?   @map("created_by") @db.VarChar(64)
+  updatedBy     String?   @map("updated_by") @db.VarChar(64)
+  createdAt     DateTime  @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt     DateTime  @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  table        DataTable       @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  uniqueValues UniqueValue[]
+
+  @@index([tableId, createdAt])
+  @@map("table_records")
+}
+
+// ==================== 唯一约束 ====================
+
+// 组合唯一约束定义，如 { fields: ["shop","sku"] }
+model UniqueConstraint {
+  id        String   @id @default(cuid())
+  tableId   String   @map("table_id")
+  name      String   @db.VarChar(128)
+  // 字段标识数组（field_key）
+  fields    Json
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamp(0)
+
+  table  DataTable      @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  values UniqueValue[]
+
+  @@index([tableId])
+  @@map("unique_constraints")
+}
+
+// 唯一值索引表：每条记录按约束写入一行，
+// values_hash = SHA-256(规范化组合值)，数据库级唯一索引 (constraintId, valuesHash)
+// 实现单字段与组合唯一约束的原子强校验（大小写敏感：hash 基于原始值）。
+model UniqueValue {
+  id           String   @id @default(cuid())
+  constraintId String   @map("constraint_id")
+  recordId     String   @map("record_id")
+  // 组合值的 SHA-256 哈希（16 进制，64 字符）
+  valuesHash   String   @map("values_hash") @db.VarChar(64)
+  // 组合值原文（用于审计与排障）：{ field_key: value }
+  values       Json?
+  createdAt    DateTime @map("created_at") @default(now()) @db.Timestamp(0)
+
+  constraint UniqueConstraint @relation(fields: [constraintId], references: [id], onDelete: Cascade)
+  record     TableRecord      @relation(fields: [recordId], references: [id], onDelete: Cascade)
+
+  @@unique([constraintId, valuesHash])
+  @@index([recordId])
+  @@map("unique_values")
+}
+
+// ==================== API Key / Refresh Token / 审计 ====================
+
+model ApiKey {
+  id          String    @id @default(cuid())
+  name        String    @db.VarChar(128)
+  // 只保存完整 Key 的 SHA-256 哈希（带服务端 pepper）
+  keyHash     String    @unique @map("key_hash") @db.VarChar(128)
+  // 用于界面展示的前缀，如 dms_a1b2c3d4...
+  keyPrefix   String    @map("key_prefix") @db.VarChar(24)  // 权限范围（权限编码数组），空数组 = 默认记录读写范围
+  scopes      Json?
+  createdById String    @map("created_by_id")
+  expiresAt   DateTime? @map("expires_at") @db.Timestamp(0)
+  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamp(0)
+  isActive    Boolean   @map("is_active") @default(true)
+  createdAt   DateTime  @map("created_at") @default(now()) @db.Timestamp(0)
+  updatedAt   DateTime  @map("updated_at") @updatedAt @db.Timestamp(0)
+
+  createdBy User @relation(fields: [createdById], references: [id])
+
+  @@map("api_keys")
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  // 只保存 Refresh Token 的 SHA-256 哈希
+  tokenHash String    @unique @map("token_hash") @db.VarChar(128)
+  expiresAt DateTime  @map("expires_at") @db.Timestamp(0)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamp(0)
+  ip        String?   @db.VarChar(64)
+  userAgent String?   @map("user_agent") @db.VarChar(512)
+  createdAt DateTime  @map("created_at") @default(now()) @db.Timestamp(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model AuditLog {
+  id           String    @id @default(cuid())
+  userId       String?   @map("user_id")
+  action       String    @db.VarChar(64)
+  resourceType String?   @map("resource_type") @db.VarChar(64)
+  resourceId   String?   @map("resource_id") @db.VarChar(64)
+  ip           String?   @db.VarChar(64)
+  userAgent    String?   @map("user_agent") @db.VarChar(512)
+  detail       Json?
+  createdAt    DateTime  @map("created_at") @default(now()) @db.Timestamp(0)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}

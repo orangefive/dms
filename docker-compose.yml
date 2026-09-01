@@ -1,0 +1,79 @@
+# ============ 企业多维数据管理系统 - Docker Compose ============
+# 用法：
+#   cp .env.example .env   # 按需修改密钥
+#   docker compose up -d --build
+# 访问：http://localhost:8080  （Swagger: http://localhost:8080/api/docs）
+# 初始化管理员：docker compose exec backend npm run create-admin
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: dms-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-dms_root_change_me}
+      MYSQL_DATABASE: dms_dev
+      MYSQL_USER: dms
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-dms_password_change_me}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-dms_root_change_me}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  backend:
+    build: ./backend
+    container_name: dms-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # 默认使用本 compose 的 MySQL；如需连接公司已有 MySQL，改为外部地址即可
+      DATABASE_URL: mysql://dms:${MYSQL_PASSWORD:-dms_password_change_me}@mysql:3306/dms_dev
+      JWT_SECRET: ${JWT_SECRET:?请在 .env 中配置 JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-30m}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?请在 .env 中配置 JWT_REFRESH_SECRET}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      API_KEY_SECRET: ${API_KEY_SECRET:?请在 .env 中配置 API_KEY_SECRET}
+      BATCH_INSERT_LIMIT: ${BATCH_INSERT_LIMIT:-1000}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      SWAGGER_ENABLED: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # 启动时自动执行数据库迁移（migrate deploy），随后启动服务
+    command: sh -c "npx prisma migrate deploy && node dist/src/main.js"
+
+  frontend:
+    build: ./frontend
+    container_name: dms-frontend-build
+    # 仅负责构建产物到共享卷，由 nginx 对外提供
+    volumes:
+      - frontend-dist:/shared
+    depends_on:
+      - backend
+    restart: "no"
+
+  nginx:
+    build: ./nginx
+    container_name: dms-nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - frontend-dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  mysql-data:
+  frontend-dist:

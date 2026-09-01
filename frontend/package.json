@@ -1,0 +1,35 @@
+{
+  "name": "dms-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "企业多维数据管理系统 - Vue 3 前端",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "typecheck": "vue-tsc -b",
+    "preview": "vite preview",
+    "lint": "eslint \"src/**/*.{ts,vue}\""
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.7.9",
+    "dayjs": "^1.11.13",
+    "element-plus": "^2.9.3",
+    "pinia": "^2.3.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0",
+    "vxe-pc-ui": "1.9.25",
+    "vxe-table": "4.9.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "eslint": "^9.17.0",
+    "eslint-plugin-vue": "^9.32.0",
+    "typescript": "~5.7.3",
+    "typescript-eslint": "^8.20.0",
+    "vite": "^6.0.11",
+    "vue-tsc": "^2.2.0"
+  }
+}

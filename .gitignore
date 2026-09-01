@@ -1,0 +1,28 @@
+# 依赖与构建产物
+node_modules/
+dist/
+coverage/
+
+# 环境与密钥（绝不提交）
+.env
+.env.local
+.env.*.local
+
+# 本地数据与临时目录
+.mysql-data/
+.npm-cache/
+.pw-browsers/
+.dsh-checkout/
+dsh-routing-suite/
+.agent-presets/
+*.xlsx.tmp
+.ui-import.xlsx
+
+# 日志与调试
+*.log
+pager-debug.txt
+e2e-out.txt
+
+# 系统文件
+Thumbs.db
+.DS_Store
