@@ -26,3 +26,12 @@ e2e-out.txt
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# 本地临时文件（基准输出、构建缓存等）
+.tmp/
+
+# TypeScript 增量构建信息（本地生成）
+*.tsbuildinfo
+
+# 个人/本地工作区数据
+.workbuddy/

@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消旧流水线，避免排队浪费额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  backend-static:
+    name: 后端 · 静态检查 / 单元测试 / 构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: 安装依赖
+        run: npm ci
+      - name: 生成 Prisma Client
+        run: npx prisma generate
+      - name: ESLint
+        run: npm run lint
+      - name: TypeScript 类型检查
+        run: npm run typecheck
+      - name: 单元测试
+        run: npm run test:unit
+      - name: 生产构建
+        run: npm run build
+
+  backend-e2e:
+    name: 后端 · 集成测试（真实 MySQL 8）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: dms_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/dms_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: 安装依赖
+        run: npm ci
+      - name: 生成 Prisma Client
+        run: npx prisma generate
+      - name: 等待 MySQL 可连接
+        # service 的 healthcheck 通过后再显式探活，避免首包连接被拒
+        run: |
+          for i in $(seq 1 30); do
+            if node -e "const net=require('net');const s=net.connect(3306,'127.0.0.1');s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));"; then
+              echo "MySQL 已就绪"; exit 0
+            fi
+            echo "第 $i 次探测未就绪，2 秒后重试"; sleep 2
+          done
+          echo "MySQL 连接超时" >&2; exit 1
+      - name: 集成测试（迁移 + Seed + E2E）
+        run: npm run test:e2e
+
+  frontend:
+    name: 前端 · 静态检查 / 单元测试 / 构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 安装依赖
+        run: npm ci
+      - name: ESLint
+        run: npm run lint
+      - name: 类型检查（vue-tsc）
+        run: npm run typecheck
+      - name: 单元测试（Vitest）
+        run: npm run test
+      - name: 生产构建
+        run: npm run build
+
+  compose:
+    name: 部署 · Compose 配置与镜像构建校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 准备 .env（占位值仅用于配置校验）
+        run: cp .env.example .env
+      - name: 校验 compose 配置
+        run: docker compose config --quiet
+      - name: 构建后端镜像
+        run: docker build -t dms-backend:ci ./backend
+      - name: 构建 Nginx + 前端一体化镜像
+        run: docker build -f nginx/Dockerfile -t dms-nginx:ci .

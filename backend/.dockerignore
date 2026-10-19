@@ -1,6 +1,11 @@
 node_modules
 dist
+coverage
+test
 .env
+.env.*
 *.log
 .mysql-data
-coverage
+Dockerfile
+.dockerignore
+t.txt

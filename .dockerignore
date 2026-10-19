@@ -1,0 +1,10 @@
+# 仅用于根目录作为构建上下文的镜像（nginx 一体化构建）
+.git
+**/node_modules
+**/dist
+**/coverage
+.env
+**/.env
+.tmp
+.workbuddy
+**/*.log
