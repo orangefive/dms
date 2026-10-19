@@ -8,6 +8,7 @@ import {
   Res,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { ConfigService } from '@nestjs/config';
 import { Request, Response } from 'express';
 import { IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
 import { Throttle } from '@nestjs/throttler';
@@ -16,6 +17,7 @@ import { CurrentUser } from '../common/decorators/current-auth.decorator';
 import { AuthService, AuthUserInfo } from './auth.service';
 import { AppError } from '../common/errors/app-error';
 import { ErrorCodes } from '../common/enums/error-codes';
+import { AppConfig, parseDuration } from '../config/env.validation';
 
 class LoginDto {
   @IsString()
@@ -48,7 +50,10 @@ class ChangePasswordDto {
 @ApiTags('认证')
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly configService: ConfigService,
+  ) {}
 
   @Public()
   @Post('login')
@@ -87,7 +92,7 @@ export class AuthController {
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const token = req.cookies?.[AuthService.REFRESH_COOKIE] as string | undefined;
     await this.authService.logout(token);
-    res.clearCookie(AuthService.REFRESH_COOKIE, { path: '/api/v1/auth' });
+    this.clearRefreshCookie(res);
     return { loggedOut: true };
   }
 
@@ -99,20 +104,38 @@ export class AuthController {
   }
 
   @Post('change-password')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiBearerAuth()
-  @ApiOperation({ summary: '修改自己的密码' })
+  @ApiOperation({ summary: '修改自己的密码（成功后其他会话失效）' })
   async changePassword(@CurrentUser() user: { id: string }, @Body() dto: ChangePasswordDto) {
     await this.authService.changePassword(user.id, dto.oldPassword, dto.newPassword);
     return { changed: true };
+  }
+
+  private get cfg(): AppConfig {
+    const cfg = this.configService.get<AppConfig>('app');
+    if (!cfg) {
+      throw new Error('应用配置缺失');
+    }
+    return cfg;
   }
 
   private setRefreshCookie(res: Response, token: string): void {
     res.cookie(AuthService.REFRESH_COOKIE, token, {
       httpOnly: true,
       sameSite: 'lax',
-      secure: process.env.COOKIE_SECURE === 'true',
+      secure: this.cfg.cookieSecure,
       path: '/api/v1/auth',
-      maxAge: 7 * 24 * 3600 * 1000,
+      maxAge: parseDuration(this.cfg.jwtRefreshExpiresIn),
+    });
+  }
+
+  private clearRefreshCookie(res: Response): void {
+    res.clearCookie(AuthService.REFRESH_COOKIE, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: this.cfg.cookieSecure,
+      path: '/api/v1/auth',
     });
   }
 }

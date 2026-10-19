@@ -222,8 +222,15 @@ export class FieldsController {
   async createConstraint(
     @Param('tableId') tableId: string,
     @Body() dto: CreateConstraintDto,
+    @CurrentUser() user: { id: string; username: string } | null,
   ) {
-    return this.fieldsService.createConstraint(tableId, dto.name, dto.fields);
+    return this.fieldsService.createConstraint(
+      tableId,
+      dto.name,
+      dto.fields,
+      user?.id,
+      user?.username,
+    );
   }
 
   @Delete('constraints/:id')

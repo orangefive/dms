@@ -5,6 +5,7 @@ import { getRequestContext } from '../common/request-context';
 
 export type AuditAction =
   | 'LOGIN'
+  | 'LOGIN_FAILED'
   | 'LOGOUT'
   | 'PASSWORD_CHANGE'
   | 'USER_CREATE'

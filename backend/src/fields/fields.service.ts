@@ -7,6 +7,7 @@ import { AppError } from '../common/errors/app-error';
 import { ErrorCodes } from '../common/enums/error-codes';
 import { FieldType, TableType } from '../common/enums';
 import { TablesService } from '../tables/tables.service';
+import { extractUniqueValues, hashUniqueValues } from '../common/unique-hash';
 
 export interface SelectOption {
   label: string;
@@ -145,14 +146,15 @@ export class FieldsService {
         },
       });
       if (params.isUnique) {
-        // 单字段唯一 → 自动创建唯一约束
-        await tx.uniqueConstraint.create({
+        // 单字段唯一 → 自动创建唯一约束，并回填已有记录（重复则整体回滚）
+        const constraint = await tx.uniqueConstraint.create({
           data: {
             tableId: params.tableId,
             name: `uq_${fieldKey}`,
             fields: [fieldKey] as unknown as object,
           },
         });
+        await this.backfillUniqueConstraint(tx, params.tableId, constraint.id, [fieldKey]);
       }
       return created;
     });
@@ -252,13 +254,14 @@ export class FieldsService {
       // is_unique 切换 → 同步创建/删除单字段唯一约束
       if (params.isUnique !== undefined && params.isUnique !== field.isUnique) {
         if (params.isUnique) {
-          await tx.uniqueConstraint.create({
+          const constraint = await tx.uniqueConstraint.create({
             data: {
               tableId: field.tableId,
               name: `uq_${field.fieldKey}`,
               fields: [field.fieldKey] as unknown as object,
             },
           });
+          await this.backfillUniqueConstraint(tx, field.tableId, constraint.id, [field.fieldKey]);
         } else {
           const constraint = await tx.uniqueConstraint.findFirst({
             where: { tableId: field.tableId, name: `uq_${field.fieldKey}` },
@@ -342,22 +345,14 @@ export class FieldsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      // 清理记录数据中的该字段值
-      const records = await tx.tableRecord.findMany({
-        where: { tableId: field.tableId },
-        select: { id: true, data: true },
-      });
-      for (const record of records) {
-        const data = (record.data ?? {}) as Record<string, unknown>;
-        if (field.fieldKey in data) {
-          const next = { ...data };
-          delete next[field.fieldKey];
-          await tx.tableRecord.update({
-            where: { id: record.id },
-            data: { data: next as object },
-          });
-        }
-      }
+      // 用一条 JSON_REMOVE 清理所有记录中的该字段，避免把全表记录读进 Node 内存
+      const path = `$.${field.fieldKey}`;
+      await tx.$executeRaw(
+        Prisma.sql`UPDATE table_records
+          SET data = JSON_REMOVE(data, ${path})
+          WHERE table_id = ${field.tableId}
+            AND JSON_CONTAINS_PATH(data, 'one', ${path}) = 1`,
+      );
       await tx.dataField.delete({ where: { id } });
     });
 
@@ -410,7 +405,13 @@ export class FieldsService {
     });
   }
 
-  async createConstraint(tableId: string, name: string, fieldKeys: string[]) {
+  async createConstraint(
+    tableId: string,
+    name: string,
+    fieldKeys: string[],
+    operatorId?: string,
+    operatorName?: string,
+  ) {
     const table = await this.prisma.dataTable.findUnique({ where: { id: tableId } });
     if (!table) {
       throw AppError.notFound(ErrorCodes.TABLE_NOT_FOUND, '数据表不存在');
@@ -451,19 +452,24 @@ export class FieldsService {
     if (dup) {
       throw AppError.badRequest(ErrorCodes.UNIQUE_CONSTRAINT_INVALID, `约束名称 "${name}" 已存在`);
     }
-    const constraint = await this.prisma.uniqueConstraint.create({
-      data: {
-        tableId,
-        name,
-        fields: fieldKeys as unknown as object,
-      },
+    const constraint = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.uniqueConstraint.create({
+        data: {
+          tableId,
+          name,
+          fields: fieldKeys as unknown as object,
+        },
+      });
+      // 回填历史记录；若已有重复值，唯一索引会触发 P2002 → 整个事务回滚
+      await this.backfillUniqueConstraint(tx, tableId, created.id, fieldKeys);
+      return created;
     });
     await this.audit.record({
       action: 'FIELD_UPDATE',
-      userId: '',
+      userId: operatorId ?? null,
       resourceType: 'unique_constraint',
       resourceId: constraint.id,
-      detail: { tableId, name, fields: fieldKeys },
+      detail: { tableId, name, fields: fieldKeys, by: operatorName ?? null },
     });
     return constraint;
   }
@@ -475,6 +481,71 @@ export class FieldsService {
     }
     await this.prisma.uniqueConstraint.delete({ where: { id } });
     return { deleted: true };
+  }
+
+  /**
+   * 回填唯一约束索引（历史记录）。
+   * 在事务内执行：一旦发现重复值（UniqueValue 唯一索引冲突），整个字段/约束创建回滚，
+   * 不会出现“约束建好了但历史重复数据没被约束”的半成品状态。
+   */
+  private async backfillUniqueConstraint(
+    tx: Prisma.TransactionClient,
+    tableId: string,
+    constraintId: string,
+    keys: string[],
+  ): Promise<void> {
+    const batchSize = 500;
+    let cursor: string | undefined;
+    try {
+      for (;;) {
+        const batch = await tx.tableRecord.findMany({
+          where: { tableId },
+          orderBy: { id: 'asc' },
+          take: batchSize,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          select: { id: true, data: true },
+        });
+        if (batch.length === 0) {
+          break;
+        }
+        cursor = batch[batch.length - 1].id;
+        const rows: Array<{
+          constraintId: string;
+          recordId: string;
+          valuesHash: string;
+          values: object;
+        }> = [];
+        for (const record of batch) {
+          const values = extractUniqueValues(
+            (record.data ?? {}) as Record<string, unknown>,
+            keys,
+          );
+          if (!values) {
+            continue;
+          }
+          rows.push({
+            constraintId,
+            recordId: record.id,
+            valuesHash: hashUniqueValues(values),
+            values: values as object,
+          });
+        }
+        if (rows.length > 0) {
+          await tx.uniqueValue.createMany({ data: rows });
+        }
+        if (batch.length < batchSize) {
+          break;
+        }
+      }
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw AppError.badRequest(
+          ErrorCodes.UNIQUE_CONSTRAINT_INVALID,
+          `已有记录在字段组合 [${keys.join(', ')}] 上存在重复值，无法创建唯一约束`,
+        );
+      }
+      throw err;
+    }
   }
 
   // ---- 校验 ----

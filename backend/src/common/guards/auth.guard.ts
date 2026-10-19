@@ -12,6 +12,8 @@ import { AuthContext } from '../types/auth-context';
 import { ApiKeysService } from '../../api-keys/api-keys.service';
 import { AppError } from '../errors/app-error';
 import { AppConfig } from '../../config/env.validation';
+import { PrismaService } from '../../prisma/prisma.service';
+import { loadUserAuthState } from '../permissions.loader';
 
 interface JwtPayload {
   sub: string;
@@ -24,6 +26,9 @@ interface JwtPayload {
  * - @Public() 路由跳过认证
  * - Authorization: Bearer dms_xxx → API Key 认证（n8n / 自动化脚本）
  * - Authorization: Bearer <jwt> → 网页用户 JWT 认证
+ *
+ * JWT 校验通过后仍会查询数据库确认账号存在且启用，
+ * 并把实时角色/权限写入请求上下文，供 PermissionsGuard 使用。
  */
 @Injectable()
 export class AuthGuard implements CanActivate {
@@ -32,6 +37,7 @@ export class AuthGuard implements CanActivate {
     private readonly jwtService: JwtService,
     private readonly apiKeysService: ApiKeysService,
     private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -66,22 +72,37 @@ export class AuthGuard implements CanActivate {
 
   private async authenticateJwt(token: string): Promise<AuthContext> {
     const cfg = this.configService.get<AppConfig>('app');
+    if (!cfg) {
+      throw new Error('应用配置缺失');
+    }
+
+    let payload: JwtPayload;
     try {
-      const payload = await this.jwtService.verifyAsync<JwtPayload>(token, {
-        secret: cfg?.jwtSecret ?? 'dev_jwt_secret_do_not_use_in_prod',
+      payload = await this.jwtService.verifyAsync<JwtPayload>(token, {
+        secret: cfg.jwtSecret,
       });
-      if (!payload.sub) {
-        throw new Error('missing sub');
-      }
-      return {
-        type: 'user',
-        id: payload.sub,
-        username: payload.username ?? '',
-        roleCodes: payload.roles ?? [],
-      };
     } catch {
       throw new UnauthorizedException('登录已过期或凭证无效，请重新登录');
     }
+    if (!payload.sub) {
+      throw new UnauthorizedException('登录已过期或凭证无效，请重新登录');
+    }
+
+    const state = await loadUserAuthState(this.prisma, payload.sub);
+    if (!state) {
+      throw new UnauthorizedException('账号不存在，请重新登录');
+    }
+    if (!state.isActive) {
+      throw new UnauthorizedException('账号已被禁用，请联系管理员');
+    }
+
+    return {
+      type: 'user',
+      id: state.id,
+      username: state.username,
+      roleCodes: state.roleCodes,
+      permissions: state.permissions,
+    };
   }
 
   private async authenticateApiKey(token: string): Promise<AuthContext> {

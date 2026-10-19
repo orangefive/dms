@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { DataField, Prisma } from '@prisma/client';
-import { createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';import { QueryService } from '../query-engine/query.service';
 import { FormulaService } from '../formula/formula.service';
 import { AuditService } from '../audit/audit.service';
@@ -9,6 +8,8 @@ import { ErrorCodes } from '../common/enums/error-codes';
 import { FieldType, TableType } from '../common/enums';
 import { ConfigService } from '@nestjs/config';
 import { AppConfig } from '../config/env.validation';
+import { isValidDateString, toFiniteNumber } from '../common/validation';
+import { extractUniqueValues, hashUniqueValues } from '../common/unique-hash';
 
 export interface ActorInfo {
   id?: string;
@@ -36,10 +37,27 @@ export class RecordsService {
   async create(tableId: string, data: Record<string, unknown>, actor: ActorInfo) {
     const table = await this.queryService.loadTable(tableId);
     this.assertWritable(table.tableType);
-    const fields = await this.queryService.loadFields(tableId);
+    const [fields, constraints] = await Promise.all([
+      this.queryService.loadFields(tableId),
+      this.prisma.uniqueConstraint.findMany({ where: { tableId } }),
+    ]);
+    return this.createPrepared(tableId, fields, constraints, data, actor);
+  }
+
+  /**
+   * 使用已加载的字段/约束创建记录（供 Excel 导入复用，避免逐行重复查询元数据）。
+   * @param options.audit 是否写入单条审计；批量导入时关闭，由调用方写一条汇总审计
+   */
+  async createPrepared(
+    tableId: string,
+    fields: DataField[],
+    constraints: Array<{ id: string; fields: unknown }>,
+    data: Record<string, unknown>,
+    actor: ActorInfo,
+    options: { audit?: boolean } = {},
+  ) {
     const normalized = this.validateAndNormalize(fields, data);
     const computed = this.formulaService.computeRecord(fields, normalized);
-    const constraints = await this.prisma.uniqueConstraint.findMany({ where: { tableId } });
 
     let record;
     try {
@@ -54,19 +72,22 @@ export class RecordsService {
           },
         });
         await this.syncUniqueValues(tx, constraints, created.id, computed.data);
-        return created;      });
+        return created;
+      });
     } catch (err) {
       this.rethrowUniqueViolation(err);
       throw err;
     }
 
-    await this.audit.record({
-      action: 'RECORD_CREATE',
-      userId: actor.id ?? null,
-      resourceType: 'record',
-      resourceId: record.id,
-      detail: { tableId, keys: Object.keys(normalized) },
-    });
+    if (options.audit !== false) {
+      await this.audit.record({
+        action: 'RECORD_CREATE',
+        userId: actor.id ?? null,
+        resourceType: 'record',
+        resourceId: record.id,
+        detail: { tableId, keys: Object.keys(normalized) },
+      });
+    }
     return { id: record.id, data: computed.data };
   }
 
@@ -80,10 +101,23 @@ export class RecordsService {
     }
 
     const normalized = this.validateAndNormalize(fields, data);
+    // 显式传入 null 表示清空该字段；undefined 视为未提供
+    const merged = { ...(existing.data as Record<string, unknown>) };
+    for (const key of Object.keys(data)) {
+      if (data[key] === null || data[key] === undefined) {
+        delete merged[key];
+      } else if (key in normalized) {
+        merged[key] = normalized[key];
+      }
+    }
     // 仅重算受变更字段影响的公式及其下游
     const changedKeys = new Set(Object.keys(data));
-    const merged = { ...(existing.data as Record<string, unknown>), ...normalized };
-    const computed = this.formulaService.computeRecord(fields, merged, changedKeys);
+    const computed = this.formulaService.computeRecord(
+      fields,
+      merged,
+      changedKeys,
+      (existing.formulaErrors ?? null) as Record<string, string> | null,
+    );
     const constraints = await this.prisma.uniqueConstraint.findMany({ where: { tableId } });
 
     let record;
@@ -246,7 +280,10 @@ export class RecordsService {
   ) {
     const table = await this.queryService.loadTable(tableId);
     this.assertWritable(table.tableType);
-    const fields = await this.queryService.loadFields(tableId);
+    const [fields, constraints] = await Promise.all([
+      this.queryService.loadFields(tableId),
+      this.prisma.uniqueConstraint.findMany({ where: { tableId } }),
+    ]);
     this.validateMatchFields(fields, match);
 
     // EXACT 精确匹配定位（单字段或多字段组合，全部 eq，禁止 LIKE/contains）
@@ -255,22 +292,45 @@ export class RecordsService {
       operator: 'eq' as const,
       value,
     }));
-    const outcome = await this.queryService.query(tableId, {
-      filters,
-      page: 1,
-      pageSize: 2,
-    });
-    const found = outcome.records[0] ?? null;
-    const multi = outcome.records.length > 1;
-    if (multi) {
-      throw AppError.badRequest(
-        ErrorCodes.MULTIPLE_RECORDS_FOUND,
-        'Upsert 匹配到多条记录（match 字段不是唯一约束），请使用唯一字段或组合唯一约束',
-      );
-    }
+    const locate = async () => {
+      const outcome = await this.queryService.query(tableId, {
+        filters,
+        page: 1,
+        pageSize: 2,
+      });
+      if (outcome.records.length > 1) {
+        throw AppError.badRequest(
+          ErrorCodes.MULTIPLE_RECORDS_FOUND,
+          'Upsert 匹配到多条记录（match 字段不是唯一约束），请使用唯一字段或组合唯一约束',
+        );
+      }
+      return outcome.records[0] ?? null;
+    };
+
+    const found = await locate();
     if (found === null) {
       const merged = { ...match, ...data };
-      const created = await this.create(tableId, merged, actor);
+      let created;
+      try {
+        created = await this.createPrepared(tableId, fields, constraints, merged, actor);
+      } catch (err) {
+        // 并发 Upsert：另一个请求先插入成功 → 重新定位后按更新处理
+        if (err instanceof AppError && err.code === ErrorCodes.DUPLICATE_UNIQUE_FIELD) {
+          const again = await locate();
+          if (again) {
+            const updated = await this.update(tableId, again.id as string, data, actor);
+            await this.audit.record({
+              action: 'RECORD_UPSERT',
+              userId: actor.id ?? null,
+              resourceType: 'record',
+              resourceId: updated.id,
+              detail: { tableId, mode: 'update', match, concurrentRetry: true },
+            });
+            return { mode: 'update' as const, record: updated };
+          }
+        }
+        throw err;
+      }
       await this.audit.record({
         action: 'RECORD_UPSERT',
         userId: actor.id ?? null,
@@ -364,16 +424,14 @@ export class RecordsService {
     const name = field.name;
     switch (field.fieldType) {
       case FieldType.NUMBER: {
-        if (typeof value === 'number' && Number.isFinite(value)) {
-          return value;
+        const num = toFiniteNumber(value);
+        if (num === null) {
+          throw AppError.badRequest(
+            ErrorCodes.INVALID_FIELD_TYPE,
+            `字段 "${name}" 需要有限数字类型，收到: ${JSON.stringify(value)}`,
+          );
         }
-        if (typeof value === 'string' && value.trim() !== '' && !Number.isNaN(Number(value))) {
-          return Number(value); // n8n 常见字符串数字，自动转换
-        }
-        throw AppError.badRequest(
-          ErrorCodes.INVALID_FIELD_TYPE,
-          `字段 "${name}" 需要数字类型，收到: ${JSON.stringify(value)}`,
-        );
+        return num; // n8n 常见字符串数字，自动转换
       }
       case FieldType.STRING:
       case FieldType.SINGLE_LINE_TEXT:
@@ -429,19 +487,11 @@ export class RecordsService {
           throw AppError.badRequest(ErrorCodes.INVALID_FIELD_TYPE, `字段 "${name}" 需要日期字符串`);
         }
         const showTime = Boolean((field.config as { showTime?: boolean } | null)?.showTime);
-        const pattern = showTime
-          ? /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$/
-          : /^\d{4}-\d{2}-\d{2}$/;
-        if (!pattern.test(value)) {
+        if (!isValidDateString(value, showTime)) {
           throw AppError.badRequest(
             ErrorCodes.INVALID_DATE_FORMAT,
-            `字段 "${name}" 日期格式不正确（期望 ${showTime ? 'YYYY-MM-DD 或 YYYY-MM-DD HH:mm:ss' : 'YYYY-MM-DD'}）`,
+            `字段 "${name}" 日期不合法（期望 ${showTime ? 'YYYY-MM-DD 或 YYYY-MM-DD HH:mm:ss' : 'YYYY-MM-DD'}，且必须是真实存在的日期）`,
           );
-        }
-        const [d, t] = value.split(' ');
-        const parsed = Date.parse(`${d}T${t ?? '00:00:00'}`);
-        if (Number.isNaN(parsed)) {
-          throw AppError.badRequest(ErrorCodes.INVALID_DATE_FORMAT, `字段 "${name}" 不是有效日期`);
         }
         return value;
       }
@@ -497,38 +547,19 @@ export class RecordsService {
         continue; // 防御：约束字段必须是数组
       }
       const keys = raw as string[];
-      const values: Record<string, unknown> = {};
-      let skip = false;
-      for (const key of keys) {
-        const v = data[key];
-        if (v === null || v === undefined) {
-          skip = true; // 组合约束部分为空 → 跳过（与 MySQL NULL 语义一致）
-          break;
-        }
-        values[key] = v;
+      const values = extractUniqueValues(data, keys);
+      if (!values) {
+        continue; // 组合约束部分为空 → 跳过（与 MySQL NULL 语义一致）
       }
-      if (skip) {
-        continue;
-      }
-      const hash = this.hashUniqueValues(values);
       await tx.uniqueValue.create({
         data: {
           constraintId: constraint.id,
           recordId,
-          valuesHash: hash,
+          valuesHash: hashUniqueValues(values),
           values: values as unknown as object,
         },
       });
     }
-  }
-
-  /** 组合唯一值哈希：基于原始值的规范化 JSON（大小写敏感、类型敏感） */
-  private hashUniqueValues(values: Record<string, unknown>): string {
-    const canonical = Object.keys(values)
-      .sort()
-      .map((k) => `${k}=${JSON.stringify(values[k])}`)
-      .join('|');
-    return createHash('sha256').update(canonical).digest('hex');
   }
 
   private rethrowUniqueViolation(err: unknown, batch = false): void {

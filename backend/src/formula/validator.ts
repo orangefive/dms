@@ -12,6 +12,17 @@ import {
 
 const NUMERIC_TYPES = new Set(['NUMBER']);
 
+/** 运算符优先级：比较 < 加减 < 乘除 */
+function binaryPrecedence(op: string): number {
+  if (['==', '!=', '>', '>=', '<', '<='].includes(op)) {
+    return 1;
+  }
+  if (op === '+' || op === '-') {
+    return 2;
+  }
+  return 3;
+}
+
 /**
  * 公式校验器：
  * - 语法校验（tokenizer + parser）
@@ -252,8 +263,8 @@ export class FormulaValidator {
     }
   }
 
-  /** 从 AST 渲染规范表达式（字段用显示名） */
-  render(node: FormulaNode, byId: Map<string, FormulaFieldMeta>): string {
+  /** 从 AST 渲染规范表达式（字段用显示名），按优先级补全括号，保证可被重新解析为同一语义 */
+  render(node: FormulaNode, byId: Map<string, FormulaFieldMeta>, parentPrecedence = 0): string {
     switch (node.type) {
       case 'number':
         return String(node.value);
@@ -261,12 +272,22 @@ export class FormulaValidator {
         const f = byId.get(node.fieldId);
         return `{${f ? f.name : node.displayName}}`;
       }
-      case 'unary':
-        return `${node.op}${this.render(node.operand, byId)}`;
-      case 'binary':
-        return `${this.render(node.left, byId)} ${node.op} ${this.render(node.right, byId)}`;
+      case 'unary': {
+        const operand = this.render(node.operand, byId, 4);
+        const text = `${node.op}${operand}`;
+        return 3 < parentPrecedence ? `(${text})` : text;
+      }
+      case 'binary': {
+        const precedence = binaryPrecedence(node.op);
+        const left = this.render(node.left, byId, precedence);
+        // 减号/除号的右侧同优先级也要加括号：a - (b - c)、a / (b * c)
+        const rightRequiresParens = node.op === '-' || node.op === '/';
+        const right = this.render(node.right, byId, precedence + (rightRequiresParens ? 1 : 0));
+        const text = `${left} ${node.op} ${right}`;
+        return precedence < parentPrecedence ? `(${text})` : text;
+      }
       case 'call':
-        return `${node.name}(${node.args.map((a) => this.render(a, byId)).join(', ')})`;
+        return `${node.name}(${node.args.map((a) => this.render(a, byId, 0)).join(', ')})`;
       default:
         return '';
     }

@@ -5,6 +5,7 @@ import { DataField } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueryService } from '../query-engine/query.service';
 import { RecordsService, ActorInfo } from '../records/records.service';
+import { AuditService } from '../audit/audit.service';
 import { AppError } from '../common/errors/app-error';
 import { ErrorCodes } from '../common/enums/error-codes';
 import { FieldType, TableType } from '../common/enums';
@@ -20,6 +21,7 @@ export interface ImportResult {
   imported: number;
   totalRows: number;
   skippedColumns: string[];
+  duplicateColumns: string[];
   errors: ImportRowError[];
 }
 
@@ -48,6 +50,7 @@ export class ImportService {
     private readonly queryService: QueryService,
     private readonly recordsService: RecordsService,
     private readonly configService: ConfigService,
+    private readonly audit: AuditService,
   ) {}
 
   async importExcel(tableId: string, buffer: Buffer, actor: ActorInfo): Promise<ImportResult> {
@@ -93,11 +96,18 @@ export class ImportService {
       throw AppError.badRequest(ErrorCodes.INVALID_EXCEL_FILE, 'Excel 第一行必须为字段表头');
     }
 
-    // 列匹配：field_key 精确 → 字段名称精确
+    // 列匹配：field_key 精确 → 字段名称精确；重复表头只取第一列
+    const seenHeaders = new Set<string>();
+    const duplicateColumns: string[] = [];
     const columns: ColumnDef[] = headers.map((header, index) => {
       if (!header) {
         return { header, excelIndex: index + 1, field: null, skip: true, reason: '空表头' };
       }
+      if (seenHeaders.has(header)) {
+        duplicateColumns.push(header);
+        return { header, excelIndex: index + 1, field: null, skip: true, reason: '表头重复（仅导入第一列）' };
+      }
+      seenHeaders.add(header);
       const field =
         fields.find((f) => f.fieldKey === header) ?? fields.find((f) => f.name === header);
       if (!field) {
@@ -121,6 +131,9 @@ export class ImportService {
     const errors: ImportRowError[] = [];
     let imported = 0;
 
+    // 元数据只加载一次，避免每行都查询表/字段/唯一约束
+    const constraints = await this.prisma.uniqueConstraint.findMany({ where: { tableId } });
+
     for (let r = 2; r <= sheet.rowCount; r += 1) {
       const row = sheet.getRow(r);
       if (isBlankRow(row)) {
@@ -141,7 +154,9 @@ export class ImportService {
         continue;
       }
       try {
-        await this.recordsService.create(tableId, data, actor);
+        await this.recordsService.createPrepared(tableId, fields, constraints, data, actor, {
+          audit: false,
+        });
         imported += 1;
       } catch (err) {
         if (err instanceof AppError) {
@@ -152,7 +167,22 @@ export class ImportService {
       }
     }
 
-    return { imported, totalRows, skippedColumns, errors };
+    // 导入是“逐行独立事务”，一次汇总审计代替 N 条记录审计
+    await this.audit.record({
+      action: 'RECORD_BATCH_CREATE',
+      userId: actor.id ?? null,
+      resourceType: 'table',
+      resourceId: tableId,
+      detail: {
+        source: 'excel-import',
+        totalRows,
+        imported,
+        failed: errors.length,
+        skippedColumns,
+      },
+    });
+
+    return { imported, totalRows, skippedColumns, duplicateColumns, errors };
   }
 
   /** 生成导入模板（第一行为可导入字段名） */

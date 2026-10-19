@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Param,
   Patch,
@@ -103,27 +104,29 @@ export class ApiKeysController {
   @ApiOperation({ summary: '创建 API 密钥（完整 Key 仅此一次返回）' })
   async create(
     @Body() dto: CreateApiKeyDto,
-    @CurrentUser() user: { id: string; username: string },
+    @CurrentUser() user: { id: string; username: string; permissions: string[] } | null,
   ) {
+    const operator = this.requireUser(user);
     const { key, keyHash, keyPrefix } = this.apiKeysService.generateKey();
     const scopes = normalizeScopes(dto.scopes);
+    this.assertCanGrantScopes(operator, scopes);
     const record = await this.prisma.apiKey.create({
       data: {
         name: dto.name,
         keyHash,
         keyPrefix,
         scopes: scopes as unknown as object,
-        createdById: user.id,
+        createdById: operator.id,
         expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
       },
       select: { id: true, name: true, keyPrefix: true, scopes: true, expiresAt: true, createdAt: true },
     });
     await this.audit.record({
       action: 'API_KEY_CREATE',
-      userId: user.id,
+      userId: operator.id,
       resourceType: 'api_key',
       resourceId: record.id,
-      detail: { name: dto.name, by: user.username },
+      detail: { name: dto.name, by: operator.username },
     });
     return { ...record, key };
   }
@@ -134,8 +137,12 @@ export class ApiKeysController {
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateApiKeyDto,
-    @CurrentUser() user: { id: string },
+    @CurrentUser() user: { id: string; permissions: string[] } | null,
   ) {
+    const operator = this.requireUser(user);
+    if (dto.scopes !== undefined) {
+      this.assertCanGrantScopes(operator, normalizeScopes(dto.scopes));
+    }
     const existing = await this.prisma.apiKey.findUnique({ where: { id } });
     if (!existing) {
       throw AppError.notFound(ErrorCodes.NOT_FOUND, 'API 密钥不存在');
@@ -156,7 +163,7 @@ export class ApiKeysController {
     });
     await this.audit.record({
       action: 'API_KEY_UPDATE',
-      userId: user.id,
+      userId: operator.id,
       resourceType: 'api_key',
       resourceId: id,
       detail: { name: existing.name },
@@ -167,7 +174,11 @@ export class ApiKeysController {
   @Delete(':id')
   @Permissions('api-key:delete')
   @ApiOperation({ summary: '删除 API 密钥' })
-  async remove(@Param('id') id: string, @CurrentUser() user: { id: string }) {
+  async remove(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string; permissions: string[] } | null,
+  ) {
+    const operator = this.requireUser(user);
     const existing = await this.prisma.apiKey.findUnique({ where: { id } });
     if (!existing) {
       throw AppError.notFound(ErrorCodes.NOT_FOUND, 'API 密钥不存在');
@@ -175,11 +186,36 @@ export class ApiKeysController {
     await this.prisma.apiKey.delete({ where: { id } });
     await this.audit.record({
       action: 'API_KEY_DELETE',
-      userId: user.id,
+      userId: operator.id,
       resourceType: 'api_key',
       resourceId: id,
       detail: { name: existing.name },
     });
     return { deleted: true };
+  }
+
+  /**
+   * API Key 管理只允许网页登录用户操作。
+   * 同时禁止非管理员创建超出自身权限范围的 Key，避免权限提升。
+   */
+  private requireUser<T extends { id: string; permissions: string[] }>(
+    user: T | null,
+  ): T {
+    if (!user) {
+      throw new ForbiddenException('API 密钥管理仅支持网页登录用户');
+    }
+    return user;
+  }
+
+  private assertCanGrantScopes(user: { permissions: string[] }, scopes: string[]): void {
+    if (user.permissions.includes('*')) {
+      return;
+    }
+    const missing = scopes.filter((s) => !user.permissions.includes(s));
+    if (missing.length > 0) {
+      throw new ForbiddenException(
+        `不能授予超出自身权限的 API Key 范围（缺少: ${missing.join(', ')}）`,
+      );
+    }
   }
 }

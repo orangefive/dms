@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AppError } from '../common/errors/app-error';
 import { ErrorCodes } from '../common/enums/error-codes';
 import { FormulaEvaluator } from './evaluator';
+import { FormulaError } from './formula.errors';
 import { FormulaValidator } from './validator';
 import {
   affectedFormulas,
@@ -59,6 +60,7 @@ export class FormulaService {
     fields: DataField[],
     data: Record<string, unknown>,
     changedKeys?: Set<string>,
+    previousErrors?: Record<string, string> | null,
   ): FormulaComputationResult {
     const formulaFields = fields.filter((f) => f.fieldType === 'FORMULA');
     if (formulaFields.length === 0) {
@@ -93,7 +95,15 @@ export class FormulaService {
     }
 
     const out = { ...data };
+    // 保留未参与本次重算的历史错误，避免依赖它的公式把错误值当成 0
     const formulaErrors: Record<string, string> = {};
+    if (previousErrors) {
+      for (const [key, code] of Object.entries(previousErrors)) {
+        if (formulaById.has(fieldIdByKey.get(key) ?? '')) {
+          formulaErrors[key] = code;
+        }
+      }
+    }
 
     for (const formulaId of order) {
       const f = formulaById.get(formulaId);
@@ -106,11 +116,18 @@ export class FormulaService {
         if (!key) {
           return null;
         }
+        if (formulaErrors[key]) {
+          throw new FormulaError(
+            ErrorCodes.FORMULA_DEPENDENCY_ERROR,
+            `依赖的公式字段 "${key}" 计算失败（${formulaErrors[key]}）`,
+          );
+        }
         return out[key] ?? null;
       };
       try {
         const value = this.evaluator.evaluate(ast, resolve);
         out[f.fieldKey] = value;
+        delete formulaErrors[f.fieldKey];
       } catch (err) {
         const code =
           err instanceof Error && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
@@ -152,7 +169,7 @@ export class FormulaService {
       return { total: 0, processed: 0, failed: 0 };
     }
 
-    let total = 0;
+    const total = await this.prisma.tableRecord.count({ where: { tableId } });
     let processed = 0;
     const failed = 0;
 
@@ -170,7 +187,6 @@ export class FormulaService {
         break;
       }
       cursor = batch[batch.length - 1].id;
-      total += batch.length;
 
       const updates: { id: string; data: unknown; formulaErrors: unknown }[] = [];
       for (const record of batch) {

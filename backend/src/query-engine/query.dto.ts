@@ -63,11 +63,12 @@ export class QueryDto {
   @Type(() => QuerySortDto)
   sort?: QuerySortDto[];
 
-  @ApiPropertyOptional({ description: '页码', default: 1 })
+  @ApiPropertyOptional({ description: '页码（上限 100000）', default: 1 })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(100_000)
   page: number = 1;
 
   @ApiPropertyOptional({ description: '每页数量，默认 300，最大 500', default: 300, enum: [100, 200, 300, 500] })

@@ -4,6 +4,7 @@ import { AuditService } from '../audit/audit.service';
 import { AppError } from '../common/errors/app-error';
 import { ErrorCodes } from '../common/enums/error-codes';
 import { RoleCode } from '../common/enums';
+import { assertPasswordStrength } from '../auth/auth.service';
 import * as bcrypt from 'bcryptjs';
 
 export interface UserWithRoles {
@@ -48,9 +49,7 @@ export class UsersService {
     if (!/^[A-Za-z0-9_.-]{2,64}$/.test(params.username)) {
       throw AppError.badRequest(ErrorCodes.VALIDATION_ERROR, '用户名只能包含字母、数字、_ . -，长度 2-64');
     }
-    if (params.password.length < 8 || !/[A-Za-z]/.test(params.password) || !/[0-9]/.test(params.password)) {
-      throw AppError.badRequest(ErrorCodes.PASSWORD_TOO_WEAK, '密码至少 8 位，且必须同时包含字母和数字');
-    }
+    assertPasswordStrength(params.password);
     const roles = await this.resolveRoles(params.roleCodes);
     const passwordHash = await bcrypt.hash(params.password, 10);
     try {
@@ -111,6 +110,15 @@ export class UsersService {
     if (params.isActive === false && userId === params.operatorId) {
       throw AppError.badRequest(ErrorCodes.CANNOT_DISABLE_SELF, '不能禁用当前登录账号');
     }
+    if (params.isActive === false && (await this.isLastActiveAdmin(existing.roles))) {
+      throw AppError.badRequest(
+        ErrorCodes.LAST_ADMIN_PROTECTED,
+        '系统至少需要保留一个启用状态的管理员账号',
+      );
+    }
+    if (params.password) {
+      assertPasswordStrength(params.password);
+    }
     const newPasswordHash = params.password
       ? await bcrypt.hash(params.password, 10)
       : undefined;
@@ -119,10 +127,10 @@ export class UsersService {
     if (params.roleCodes) {
       const roles = await this.resolveRoles(params.roleCodes);
       const isAdmin = roles.some((r) => r.code === RoleCode.ADMIN);
-      if (!isAdmin && (await this.isLastAdmin(existing.id, existing.roles))) {
+      if (!isAdmin && (await this.isLastActiveAdmin(existing.roles))) {
         throw AppError.badRequest(
           ErrorCodes.LAST_ADMIN_PROTECTED,
-          '系统至少需要保留一个管理员账号',
+          '系统至少需要保留一个启用状态的管理员账号',
         );
       }
       roleLinks = roles.map((r) => ({ roleId: r.id }));
@@ -143,6 +151,13 @@ export class UsersService {
         if (roleLinks) {
           await tx.userRole.deleteMany({ where: { userId } });
           await tx.userRole.createMany({ data: roleLinks.map((r) => ({ userId, roleId: r.roleId })) });
+        }
+        // 禁用账号或管理员重置密码后，立即撤销该用户全部 Refresh Token
+        if (params.isActive === false || newPasswordHash) {
+          await tx.refreshToken.updateMany({
+            where: { userId, revokedAt: null },
+            data: { revokedAt: new Date() },
+          });
         }
         return updated;
       });
@@ -182,8 +197,8 @@ export class UsersService {
     if (!existing) {
       throw AppError.notFound(ErrorCodes.NOT_FOUND, '用户不存在');
     }
-    if (await this.isLastAdmin(existing.id, existing.roles)) {
-      throw AppError.badRequest(ErrorCodes.LAST_ADMIN_PROTECTED, '系统至少需要保留一个管理员账号');
+    if (await this.isLastActiveAdmin(existing.roles)) {
+      throw AppError.badRequest(ErrorCodes.LAST_ADMIN_PROTECTED, '系统至少需要保留一个启用状态的管理员账号');
     }
     await this.prisma.user.delete({ where: { id: userId } });
     await this.audit.record({
@@ -195,9 +210,8 @@ export class UsersService {
     });
   }
 
-  /** 用户是否当前系统中的最后一个管理员 */
-  private async isLastAdmin(
-    userId: string,
+  /** 用户是否当前系统中最后一个“启用状态”的管理员 */
+  private async isLastActiveAdmin(
     roles: Array<{ role: { code: string } }>,
   ): Promise<boolean> {
     const isAdmin = roles.some((r) => r.role.code === RoleCode.ADMIN);
@@ -205,7 +219,10 @@ export class UsersService {
       return false;
     }
     const adminCount = await this.prisma.user.count({
-      where: { roles: { some: { role: { code: RoleCode.ADMIN } } } },
+      where: {
+        isActive: true,
+        roles: { some: { role: { code: RoleCode.ADMIN } } },
+      },
     });
     return adminCount <= 1;
   }

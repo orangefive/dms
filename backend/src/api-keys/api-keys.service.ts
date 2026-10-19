@@ -69,10 +69,16 @@ export class ApiKeysService {
     if (record.expiresAt && record.expiresAt < new Date()) {
       throw AppError.unauthorized(ErrorCodes.API_KEY_EXPIRED, 'API Key 已过期');
     }
-    // 异步更新最后使用时间（不阻塞请求）
-    void this.prisma.apiKey
-      .update({ where: { id: record.id }, data: { lastUsedAt: new Date() } })
-      .catch(() => undefined);
+    // 最后使用时间：最多每分钟写一次，避免每个请求都产生一次写入
+    const staleBefore = new Date(Date.now() - 60_000);
+    if (!record.lastUsedAt || record.lastUsedAt < staleBefore) {
+      void this.prisma.apiKey
+        .updateMany({
+          where: { id: record.id, OR: [{ lastUsedAt: null }, { lastUsedAt: { lt: staleBefore } }] },
+          data: { lastUsedAt: new Date() },
+        })
+        .catch(() => undefined);
+    }
     return { id: record.id, name: record.name, scopes: normalizeScopes(record.scopes as string[] | null) };
   }
 

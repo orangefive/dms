@@ -1,5 +1,6 @@
 import { FormulaError } from './formula.errors';
 import { FormulaNode } from './formula.types';
+import { toFiniteNumber } from '../common/validation';
 
 export type ValueResolver = (fieldId: string) => unknown;
 
@@ -59,8 +60,8 @@ export class FormulaEvaluator {
       throw new FormulaError('FORMULA_TYPE_ERROR', `字段值为布尔类型，不能参与数学计算（field: ${fieldId}）`);
     }
     if (typeof v === 'string') {
-      const n = Number(v);
-      if (!Number.isNaN(n) && v.trim() !== '') {
+      const n = toFiniteNumber(v);
+      if (n !== null) {
         return n;
       }
       throw new FormulaError('FORMULA_TYPE_ERROR', `字段值无法转换为数字（field: ${fieldId}，值: "${v}"）`);
@@ -97,16 +98,16 @@ export class FormulaEvaluator {
   private arithmetic(op: string, left: number, right: number): number {
     switch (op) {
       case '+':
-        return left + right;
+        return ensureFinite(left + right, '加法');
       case '-':
-        return left - right;
+        return ensureFinite(left - right, '减法');
       case '*':
-        return left * right;
+        return ensureFinite(left * right, '乘法');
       case '/':
         if (right === 0) {
           throw new FormulaError(DIV_ZERO, '除数不能为 0');
         }
-        return left / right;
+        return ensureFinite(left / right, '除法');
       default:
         throw new FormulaError('FORMULA_SYNTAX_ERROR', `未知算术运算符 ${op}`);
     }
@@ -115,24 +116,32 @@ export class FormulaEvaluator {
   private callFunction(name: string, args: number[]): number {
     switch (name) {
       case 'SUM':
-        return args.reduce((a, b) => a + b, 0);
+        return ensureFinite(args.reduce((a, b) => a + b, 0), 'SUM');
       case 'AVG':
-        return args.reduce((a, b) => a + b, 0) / args.length;
+        return ensureFinite(args.reduce((a, b) => a + b, 0) / args.length, 'AVG');
       case 'PRODUCT':
-        return args.reduce((a, b) => a * b, 1);
+        return ensureFinite(args.reduce((a, b) => a * b, 1), 'PRODUCT');
       case 'DIVIDE': {
         const [a, b] = args;
         if (b === 0) {
           throw new FormulaError(DIV_ZERO, '除数不能为 0');
         }
-        return a / b;
+        return ensureFinite(a / b, 'DIVIDE');
       }
       case 'MAX':
-        return Math.max(...args);
+        return ensureFinite(Math.max(...args), 'MAX');
       case 'MIN':
-        return Math.min(...args);
+        return ensureFinite(Math.min(...args), 'MIN');
       default:
         throw new FormulaError('FORMULA_INVALID_FUNCTION', `未知函数 ${name}`);
     }
   }
+}
+
+/** 计算结果必须是有限数值，避免 Infinity/NaN 写入 JSON 后变成 null */
+function ensureFinite(value: number, where: string): number {
+  if (!Number.isFinite(value)) {
+    throw new FormulaError('FORMULA_TYPE_ERROR', `${where} 计算结果不是有限数值`);
+  }
+  return value;
 }

@@ -2,6 +2,7 @@ import { DataField } from '@prisma/client';
 import { AppError } from '../common/errors/app-error';
 import { ErrorCodes } from '../common/enums/error-codes';
 import { FieldType } from '../common/enums';
+import { isNumericInput, isValidDateString, toFiniteNumber } from '../common/validation';
 import { QueryFilter, QueryOperator, QuerySort, QUERY_OPERATORS } from './query.types';
 
 /** 各字段类型允许的操作符白名单（需求 §13） */
@@ -27,40 +28,16 @@ export function operatorsForField(field: DataField): QueryOperator[] {
   return OPERATORS_BY_TYPE[field.fieldType] ?? [];
 }
 
-const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
-const DATE_TIME = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
-
-export function isValidDateString(value: string, showTime: boolean): boolean {
-  if (!showTime) {
-    if (!DATE_ONLY.test(value)) {
-      return false;
-    }
-    return !Number.isNaN(Date.parse(value));
-  }
-  if (DATE_ONLY.test(value)) {
-    // 配置了显示时间时，也允许纯日期（等价于当日 00:00:00 之外的业务输入由用户决定）
-    return !Number.isNaN(Date.parse(value));
-  }
-  if (!DATE_TIME.test(value)) {
-    return false;
-  }
-  const [d, t] = value.split(' ');
-  const parsed = Date.parse(`${d}T${t}`);
-  return !Number.isNaN(parsed);
-}
-
 export function isNumericValue(v: unknown): v is number | string {
-  if (typeof v === 'number') {
-    return Number.isFinite(v);
-  }
-  if (typeof v === 'string' && v.trim() !== '') {
-    return !Number.isNaN(Number(v));
-  }
-  return false;
+  return isNumericInput(v);
 }
 
 export function normalizeNumber(v: unknown): number {
-  return typeof v === 'number' ? v : Number(v);
+  const n = toFiniteNumber(v);
+  if (n === null) {
+    throw AppError.badRequest(ErrorCodes.QUERY_INVALID_VALUE, '需要有效的有限数值');
+  }
+  return n;
 }
 
 /**

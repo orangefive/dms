@@ -18,21 +18,33 @@ export class QueryCompiler {
     private readonly externalTableName?: string,
   ) {}
 
+  /**
+   * 标识符白名单。
+   * 动态标识符不能只靠 Prisma.sql 参数绑定保护：字段名/表名是拼进 SQL 文本的。
+   * 这里对元数据来源的标识符再做一次严格校验，任何异常标识符直接拒绝。
+   */
+  private identifier(name: string): string {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(`QUERY_INVALID_IDENTIFIER: ${name}`);
+    }
+    return name;
+  }
+
   private fieldByKey(key: string): DataField | undefined {
     return this.fields.find((f) => f.fieldKey === key);
   }
 
   /** SYSTEM 表：JSON 路径表达式 */
   private rawExpr(key: string): string {
-    return `JSON_EXTRACT(data, '$.${key}')`;
+    return `JSON_EXTRACT(data, '$.${this.identifier(key)}')`;
   }
 
   private scalarExpr(key: string): string {
-    return `JSON_UNQUOTE(JSON_EXTRACT(data, '$.${key}'))`;
+    return `JSON_UNQUOTE(JSON_EXTRACT(data, '$.${this.identifier(key)}'))`;
   }
 
   private columnExpr(key: string): string {
-    return `\`${key}\``;
+    return `\`${this.identifier(key)}\``;
   }
 
   /** 编译 WHERE 片段（AND 逻辑），并返回附加参数 */
@@ -280,7 +292,10 @@ export class QueryCompiler {
   /** 编译 ORDER BY（字段来自元数据白名单） */
   compileOrderBy(sort: QuerySort[]): Prisma.Sql {
     if (sort.length === 0) {
-      return Prisma.sql`1=1`;
+      // SYSTEM 表默认按创建时间倒序；id 作为稳定的次级排序键，避免翻页重复/遗漏
+      return this.tableType === TableType.SYSTEM
+        ? Prisma.sql`created_at DESC, id DESC`
+        : Prisma.sql`1=1`;
     }
     const parts = sort.map((s) => {
       const field = this.fieldByKey(s.field);
@@ -293,13 +308,15 @@ export class QueryCompiler {
         (field.fieldType === FieldType.FORMULA && field.formulaResultType === 'NUMBER');
       if (this.tableType === TableType.SYSTEM) {
         const expr = numericLike
-          ? `CAST(JSON_UNQUOTE(JSON_EXTRACT(data, '$.${field.fieldKey}')) AS DECIMAL(65,10))`
-          : `JSON_UNQUOTE(JSON_EXTRACT(data, '$.${field.fieldKey}'))`;
+          ? `CAST(JSON_UNQUOTE(JSON_EXTRACT(data, '$.${this.identifier(field.fieldKey)}')) AS DECIMAL(65,10))`
+          : `JSON_UNQUOTE(JSON_EXTRACT(data, '$.${this.identifier(field.fieldKey)}'))`;
         return Prisma.sql`${Prisma.raw(expr)} ${Prisma.raw(dir)}`;
       }
       return Prisma.sql`${Prisma.raw(this.columnExpr(field.fieldKey))} ${Prisma.raw(dir)}`;
     });
-    return Prisma.join(parts, ', ');
+    const ordered = Prisma.join(parts, ', ');
+    // 追加主键作为稳定次级排序，保证同一排序键下分页结果稳定
+    return this.tableType === TableType.SYSTEM ? Prisma.sql`${ordered}, id ASC` : ordered;
   }
 
   /** EXTERNAL 表名（白名单校验过的标识符） */
@@ -307,7 +324,7 @@ export class QueryCompiler {
     if (!this.externalTableName) {
       throw new Error('EXTERNAL_TABLE_NOT_FOUND');
     }
-    return `\`${this.externalTableName}\``;
+    return `\`${this.identifier(this.externalTableName)}\``;
   }
 
   /** EXTERNAL 查询的列清单 */

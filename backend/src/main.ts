@@ -18,6 +18,12 @@ async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');
   app.useLogger(['log', 'error', 'warn', 'debug', 'verbose']);
 
+  // 反向代理下正确获取客户端 IP（审计日志与限流依赖）
+  if (appConfig.trustProxy) {
+    app.getHttpAdapter().getInstance().set('trust proxy', 1);
+  }
+  app.enableShutdownHooks();
+
   // 安全中间件
   app.use(
     helmet({
