@@ -25,5 +25,16 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      output: {
+        // 把体积大且低频变动的依赖拆成独立 chunk：
+        // 业务代码更新时浏览器可继续命中 vendor 缓存
+        manualChunks: {
+          'vue-vendor': ['vue', 'vue-router', 'pinia'],
+          'element-plus': ['element-plus', '@element-plus/icons-vue'],
+          'vxe-table': ['vxe-table', 'vxe-pc-ui'],
+        },
+      },
+    },
   },
 });

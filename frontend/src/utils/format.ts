@@ -39,6 +39,8 @@ export function formulaErrorText(code: string): string {
       return '#N/A';
     case 'FORMULA_CIRCULAR_REFERENCE':
       return '#CIRC!';
+    case 'FORMULA_DEPENDENCY_ERROR':
+      return '#VALUE!';
     case 'FORMULA_SYNTAX_ERROR':
       return '#ERROR!';
     default:
